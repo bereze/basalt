@@ -379,6 +379,8 @@ class Ros2bagIO : public DatasetIoInterface {
 
     int64_t min_time = std::numeric_limits<int64_t>::max();
     int64_t max_time = std::numeric_limits<int64_t>::min();
+    int64_t min_imu_time = std::numeric_limits<int64_t>::max();
+    int64_t max_imu_time = std::numeric_limits<int64_t>::min();
 
     std::vector<ros2bag::TransformStamped::SharedPtr> mocap_msgs;
     std::vector<ros2bag::PointStamped::SharedPtr> point_msgs;
@@ -393,32 +395,6 @@ class Ros2bagIO : public DatasetIoInterface {
     while (reader.has_next()) {
       auto bag_msg = reader.read_next();
       const std::string &topic = bag_msg->topic_name;
-
-      if (cam_topics.find(topic) != cam_topics.end()) {
-        ros2bag::Image::SharedPtr img_msg;
-        if (ros2bag::isType(topic_types.at(topic), "sensor_msgs/msg/Image",
-                            "sensor_msgs/Image")) {
-          img_msg = ros2bag::deserialize<ros2bag::Image>(*bag_msg);
-        } else if (ros2bag::isType(topic_types.at(topic),
-                                   "sensor_msgs/msg/CompressedImage",
-                                   "sensor_msgs/CompressedImage")) {
-          auto compressed_msg =
-              ros2bag::deserialize<ros2bag::CompressedImage>(*bag_msg);
-          img_msg = Ros2bagVioDataset::decode_compressed_image(*compressed_msg);
-        }
-
-        int64_t timestamp_ns =
-            ros2bag::stampToNanoseconds(img_msg->header.stamp);
-
-        auto &img_vec = data->image_data[timestamp_ns];
-        if (img_vec.size() == 0) img_vec.resize(data->num_cams);
-
-        img_vec[topic_to_id.at(topic)] = img_msg;
-        image_timestamps.insert(timestamp_ns);
-
-        min_time = std::min(min_time, timestamp_ns);
-        max_time = std::max(max_time, timestamp_ns);
-      }
 
       if (imu_topic == topic) {
         auto imu_msg = ros2bag::deserialize<ros2bag::Imu>(*bag_msg);
@@ -438,9 +414,70 @@ class Ros2bagIO : public DatasetIoInterface {
 
         min_time = std::min(min_time, time);
         max_time = std::max(max_time, time);
+        min_imu_time = std::min(min_imu_time, time);
+        max_imu_time = std::max(max_imu_time, time);
 
         int64_t msg_arrival_time = bag_msg->time_stamp;
         system_to_imu_offset_vec.push_back(time - msg_arrival_time);
+      }
+
+      num_msgs++;
+    }
+
+    const bool has_imu_data = !data->accel_data.empty();
+    size_t num_skipped_images = 0;
+
+    auto image_in_imu_range = [&](int64_t timestamp_ns) {
+      return !has_imu_data ||
+             (timestamp_ns >= min_imu_time && timestamp_ns <= max_imu_time);
+    };
+
+    ros2bag::Reader image_reader;
+    image_reader.open(path);
+
+    while (image_reader.has_next()) {
+      auto bag_msg = image_reader.read_next();
+      const std::string &topic = bag_msg->topic_name;
+
+      if (cam_topics.find(topic) != cam_topics.end()) {
+        ros2bag::Image::SharedPtr img_msg;
+        int64_t timestamp_ns = 0;
+
+        if (ros2bag::isType(topic_types.at(topic), "sensor_msgs/msg/Image",
+                            "sensor_msgs/Image")) {
+          img_msg = ros2bag::deserialize<ros2bag::Image>(*bag_msg);
+          timestamp_ns = ros2bag::stampToNanoseconds(img_msg->header.stamp);
+        } else if (ros2bag::isType(topic_types.at(topic),
+                                   "sensor_msgs/msg/CompressedImage",
+                                   "sensor_msgs/CompressedImage")) {
+          auto compressed_msg =
+              ros2bag::deserialize<ros2bag::CompressedImage>(*bag_msg);
+          timestamp_ns =
+              ros2bag::stampToNanoseconds(compressed_msg->header.stamp);
+
+          if (!image_in_imu_range(timestamp_ns)) {
+            num_skipped_images++;
+            continue;
+          }
+
+          img_msg = Ros2bagVioDataset::decode_compressed_image(*compressed_msg);
+        }
+
+        if (!img_msg) continue;
+
+        if (!image_in_imu_range(timestamp_ns)) {
+          num_skipped_images++;
+          continue;
+        }
+
+        auto &img_vec = data->image_data[timestamp_ns];
+        if (img_vec.size() == 0) img_vec.resize(data->num_cams);
+
+        img_vec[topic_to_id.at(topic)] = img_msg;
+        image_timestamps.insert(timestamp_ns);
+
+        min_time = std::min(min_time, timestamp_ns);
+        max_time = std::max(max_time, timestamp_ns);
       }
 
       if (mocap_topic == topic) {
@@ -479,8 +516,6 @@ class Ros2bagIO : public DatasetIoInterface {
         int64_t msg_arrival_time = bag_msg->time_stamp;
         system_to_mocap_offset_vec.push_back(time - msg_arrival_time);
       }
-
-      num_msgs++;
     }
 
     data->image_timestamps.clear();
@@ -538,6 +573,10 @@ class Ros2bagIO : public DatasetIoInterface {
 
     std::cout << "Total number of messages: " << num_msgs << std::endl;
     std::cout << "Image size: " << data->image_data.size() << std::endl;
+    if (has_imu_data) {
+      std::cout << "Skipped images outside IMU time range: "
+                << num_skipped_images << std::endl;
+    }
 
     std::cout << "Min time: " << min_time << " max time: " << max_time
               << " mocap to imu offset: " << data->mocap_to_imu_offset_ns
