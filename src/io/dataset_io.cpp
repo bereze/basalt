@@ -36,6 +36,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/io/dataset_io.h>
 #include <basalt/io/dataset_io_euroc.h>
 #include <basalt/io/dataset_io_kitti.h>
+#include <basalt/io/dataset_io_ros2bag.h>
 #include <basalt/io/dataset_io_rosbag.h>
 #include <basalt/io/dataset_io_uzh.h>
 
@@ -48,6 +49,8 @@ DatasetIoInterfacePtr DatasetIoFactory::getDatasetIo(
     return DatasetIoInterfacePtr(new EurocIO(load_mocap_as_gt));
   } else if (dataset_type == "bag") {
     return DatasetIoInterfacePtr(new RosbagIO);
+  } else if (dataset_type == "bag2" || dataset_type == "ros2bag") {
+    return DatasetIoInterfacePtr(new Ros2bagIO);
   } else if (dataset_type == "uzh") {
     return DatasetIoInterfacePtr(new UzhIO);
   } else if (dataset_type == "kitti") {

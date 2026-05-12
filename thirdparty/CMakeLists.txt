@@ -5,6 +5,7 @@ set_property(TARGET nlohmann::json PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${CMAK
 
 add_subdirectory(basalt-headers EXCLUDE_FROM_ALL)
 add_subdirectory(ros EXCLUDE_FROM_ALL)
+add_subdirectory(ros2 EXCLUDE_FROM_ALL)
 add_subdirectory(apriltag EXCLUDE_FROM_ALL)
 
 
