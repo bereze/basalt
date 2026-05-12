@@ -294,9 +294,32 @@ class SplineOptimization {
     int64_t time_interval_us = max_time_us - min_time_us;
 
     if (spline.numKnots() == 0) {
+      BASALT_ASSERT(!pose_measurements.empty());
+
       spline.setStartTimeNs(min_time_us);
-      spline.setKnots(pose_measurements.front().data,
-                      time_interval_us / dt_ns + N + 1);
+
+      const int num_knots = time_interval_us / dt_ns + N + 1;
+      spline.setKnots(pose_measurements.front().data, num_knots);
+
+      for (int i = 0; i < num_knots; i++) {
+        const int64_t knot_time_ns = min_time_us + i * dt_ns;
+        int64_t min_time_diff_ns = std::numeric_limits<int64_t>::max();
+        size_t nearest_pose_idx = 0;
+
+        for (size_t j = 0; j < pose_measurements.size(); j++) {
+          const int64_t meas_time_ns = pose_measurements[j].timestamp_ns;
+          const int64_t time_diff_ns =
+              meas_time_ns > knot_time_ns ? meas_time_ns - knot_time_ns
+                                          : knot_time_ns - meas_time_ns;
+
+          if (time_diff_ns < min_time_diff_ns) {
+            min_time_diff_ns = time_diff_ns;
+            nearest_pose_idx = j;
+          }
+        }
+
+        spline.setKnot(pose_measurements[nearest_pose_idx].data, i);
+      }
     }
 
     recompute_size();

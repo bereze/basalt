@@ -6,6 +6,33 @@
 #include "gtest/gtest.h"
 #include "test_utils.h"
 
+TEST(SplineOpt, InitUsesNearestPoseMeasurementForEachKnot) {
+  constexpr int64_t knot_dt_ns = 10;
+  basalt::SplineOptimization<5, double> spline_opt(knot_dt_ns);
+
+  auto make_pose = [](double x) {
+    return Sophus::SE3d(Sophus::SO3d(), Eigen::Vector3d(x, 0, 0));
+  };
+
+  spline_opt.addPoseMeasurement(0, make_pose(0));
+  spline_opt.addPoseMeasurement(23, make_pose(20));
+  spline_opt.addPoseMeasurement(47, make_pose(50));
+  spline_opt.resetCalib(0, {});
+
+  spline_opt.init();
+
+  const auto& spline = spline_opt.getSpline();
+  ASSERT_EQ(size_t(10), spline.numKnots());
+
+  const double expected_x[] = {0, 0, 20, 20, 50, 50, 50, 50, 50, 50};
+
+  for (size_t i = 0; i < spline.numKnots(); i++) {
+    EXPECT_TRUE(
+        spline.getKnotPos(i).isApprox(Eigen::Vector3d(expected_x[i], 0, 0)))
+        << "Unexpected initialization for knot " << i;
+  }
+}
+
 TEST(SplineOpt, SplineOptTest) {
   int num_knots = 15;
 
