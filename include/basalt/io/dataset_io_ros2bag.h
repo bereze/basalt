@@ -45,12 +45,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <map>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <basalt/io/dataset_io.h>
 #include <basalt/utils/filesystem.h>
+
+#include <opencv2/core/version.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
 
 #include <ros2bag/ros2bag.h>
 
@@ -76,6 +81,168 @@ class Ros2bagVioDataset : public VioDataset {
       gt_pose_data;  // TODO: change to eigen aligned
 
   int64_t mocap_to_imu_offset_ns = 0;
+
+  static bool has_suffix(const std::string &value, const std::string &suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) ==
+               0;
+  }
+
+  static bool camera_base_topic(const std::string &topic, bool compressed_topic,
+                                std::string *base_topic) {
+    std::string base = topic;
+    const std::string compressed_suffix = "/compressed";
+    if (compressed_topic && has_suffix(base, compressed_suffix)) {
+      base.resize(base.size() - compressed_suffix.size());
+    }
+
+    if (base == "/camera/camera/infra1/image_rect_raw" ||
+        base == "/camera/camera/infra2/image_rect_raw" ||
+        base == "/cam0/image_raw" || base == "/cam1/image_raw") {
+      if (base_topic) *base_topic = base;
+      return true;
+    }
+
+    return false;
+  }
+
+  static int bgr_to_gray_code() {
+#if CV_MAJOR_VERSION >= 3
+    return cv::COLOR_BGR2GRAY;
+#else
+    return CV_BGR2GRAY;
+#endif
+  }
+
+  static int bgra_to_gray_code() {
+#if CV_MAJOR_VERSION >= 3
+    return cv::COLOR_BGRA2GRAY;
+#else
+    return CV_BGRA2GRAY;
+#endif
+  }
+
+  static ros2bag::Image::SharedPtr decode_compressed_image(
+      const ros2bag::CompressedImage &compressed_msg) {
+    if (compressed_msg.data.empty()) {
+      throw std::runtime_error("CompressedImage data is empty.");
+    }
+    if (compressed_msg.data.size() >
+        static_cast<size_t>(std::numeric_limits<int>::max())) {
+      throw std::runtime_error("CompressedImage data is too large.");
+    }
+
+    cv::Mat compressed_data(1, static_cast<int>(compressed_msg.data.size()),
+                            CV_8UC1,
+                            const_cast<uint8_t *>(compressed_msg.data.data()));
+    cv::Mat decoded = cv::imdecode(compressed_data, cv::IMREAD_UNCHANGED);
+    if (decoded.empty()) {
+      throw std::runtime_error(
+          "Failed to decode CompressedImage with format '" +
+          compressed_msg.format + "'.");
+    }
+
+    cv::Mat gray;
+    if (decoded.channels() == 1) {
+      gray = decoded;
+    } else if (decoded.channels() == 3) {
+      cv::cvtColor(decoded, gray, bgr_to_gray_code());
+    } else if (decoded.channels() == 4) {
+      cv::cvtColor(decoded, gray, bgra_to_gray_code());
+    } else {
+      throw std::runtime_error(
+          "Unsupported decoded CompressedImage channel "
+          "count: " +
+          std::to_string(decoded.channels()) + ".");
+    }
+
+    auto msg = std::make_shared<ros2bag::Image>();
+    msg->header = compressed_msg.header;
+    msg->height = static_cast<uint32_t>(gray.rows);
+    msg->width = static_cast<uint32_t>(gray.cols);
+    msg->is_bigendian = 0;
+
+    if (gray.depth() == CV_8U) {
+      msg->encoding = "mono8";
+    } else if (gray.depth() == CV_16U) {
+      msg->encoding = "mono16";
+    } else {
+      throw std::runtime_error("Unsupported decoded CompressedImage depth: " +
+                               std::to_string(gray.depth()) + ".");
+    }
+
+    const size_t row_bytes = static_cast<size_t>(gray.cols) * gray.elemSize();
+    if (row_bytes > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+      throw std::runtime_error("Decoded CompressedImage row is too large.");
+    }
+    msg->step = static_cast<uint32_t>(row_bytes);
+    msg->data.resize(row_bytes * static_cast<size_t>(gray.rows));
+
+    if (gray.isContinuous() && gray.step == row_bytes) {
+      std::memcpy(msg->data.data(), gray.ptr(), msg->data.size());
+    } else {
+      for (int row = 0; row < gray.rows; row++) {
+        std::memcpy(msg->data.data() + static_cast<size_t>(row) * row_bytes,
+                    gray.ptr(row), row_bytes);
+      }
+    }
+
+    return msg;
+  }
+
+  static void fill_image_data(const ros2bag::Image &img_msg, ImageData &id) {
+    id.img.reset(new ManagedImage<uint16_t>(img_msg.width, img_msg.height));
+
+    if (!img_msg.header.frame_id.empty() &&
+        std::isdigit(static_cast<unsigned char>(img_msg.header.frame_id[0]))) {
+      id.exposure = std::stol(img_msg.header.frame_id) * 1e-9;
+    } else {
+      id.exposure = -1;
+    }
+
+    const size_t width = img_msg.width;
+    const size_t height = img_msg.height;
+
+    if (img_msg.encoding == "mono8") {
+      if (img_msg.step < width ||
+          img_msg.data.size() < static_cast<size_t>(img_msg.step) * height) {
+        throw std::runtime_error("Invalid mono8 image data in ros2 bag.");
+      }
+
+      uint16_t *data_out = id.img->ptr;
+      for (size_t row = 0; row < height; row++) {
+        const uint8_t *row_in =
+            img_msg.data.data() + static_cast<size_t>(img_msg.step) * row;
+        for (size_t col = 0; col < width; col++) {
+          data_out[row * width + col] = uint16_t(row_in[col]) << 8;
+        }
+      }
+    } else if (img_msg.encoding == "mono16") {
+      const size_t row_bytes = width * sizeof(uint16_t);
+      if (img_msg.step < row_bytes ||
+          img_msg.data.size() < static_cast<size_t>(img_msg.step) * height) {
+        throw std::runtime_error("Invalid mono16 image data in ros2 bag.");
+      }
+
+      uint16_t *data_out = id.img->ptr;
+      for (size_t row = 0; row < height; row++) {
+        const uint8_t *row_in =
+            img_msg.data.data() + static_cast<size_t>(img_msg.step) * row;
+        if (img_msg.is_bigendian) {
+          for (size_t col = 0; col < width; col++) {
+            data_out[row * width + col] =
+                (uint16_t(row_in[2 * col]) << 8) | row_in[2 * col + 1];
+          }
+        } else {
+          std::memcpy(data_out + row * width, row_in, row_bytes);
+        }
+      }
+    } else {
+      std::cerr << "Encoding " << img_msg.encoding << " is not supported."
+                << std::endl;
+      std::abort();
+    }
+  }
 
  public:
   ~Ros2bagVioDataset() {}
@@ -111,34 +278,7 @@ class Ros2bagVioDataset : public VioDataset {
 
         if (!img_msg) continue;
 
-        id.img.reset(
-            new ManagedImage<uint16_t>(img_msg->width, img_msg->height));
-
-        if (!img_msg->header.frame_id.empty() &&
-            std::isdigit(
-                static_cast<unsigned char>(img_msg->header.frame_id[0]))) {
-          id.exposure = std::stol(img_msg->header.frame_id) * 1e-9;
-        } else {
-          id.exposure = -1;
-        }
-
-        if (img_msg->encoding == "mono8") {
-          const uint8_t *data_in = img_msg->data.data();
-          uint16_t *data_out = id.img->ptr;
-
-          for (size_t i = 0; i < img_msg->data.size(); i++) {
-            int val = data_in[i];
-            val = val << 8;
-            data_out[i] = val;
-          }
-
-        } else if (img_msg->encoding == "mono16") {
-          std::memcpy(id.img->ptr, img_msg->data.data(), img_msg->data.size());
-        } else {
-          std::cerr << "Encoding " << img_msg->encoding << " is not supported."
-                    << std::endl;
-          std::abort();
-        }
+        fill_image_data(*img_msg, id);
       }
 
     return res;
@@ -170,13 +310,18 @@ class Ros2bagIO : public DatasetIoInterface {
     // Check serialization formats
     std::cout << "Serialization formats:" << std::endl;
     for (const auto &topic_metadata : reader.get_all_topics_and_types()) {
-      std::cout << topic_metadata.name << ": " << topic_metadata.serialization_format << std::endl;
+      std::cout << topic_metadata.name << ": "
+                << topic_metadata.serialization_format << std::endl;
       if (topic_metadata.serialization_format != "cdr") {
-        throw std::runtime_error("Unsupported serialization format: " + topic_metadata.serialization_format + " for topic " + topic_metadata.name + ". Only 'cdr' is supported.");
+        throw std::runtime_error("Unsupported serialization format: " +
+                                 topic_metadata.serialization_format +
+                                 " for topic " + topic_metadata.name +
+                                 ". Only 'cdr' is supported.");
       }
     }
 
     std::set<std::string> cam_topics;
+    std::map<std::string, std::string> cam_stream_to_topic;
     std::string imu_topic;
     std::string mocap_topic;
     std::string point_topic;
@@ -184,9 +329,18 @@ class Ros2bagIO : public DatasetIoInterface {
     for (const auto &topic_type : topic_types) {
       const std::string &topic = topic_type.first;
       const std::string &type = topic_type.second;
+      std::string cam_base_topic;
 
-      if (ros2bag::isType(type, "sensor_msgs/msg/Image", "sensor_msgs/Image")) {
-        cam_topics.insert(topic);
+      if (ros2bag::isType(type, "sensor_msgs/msg/Image", "sensor_msgs/Image") &&
+          Ros2bagVioDataset::camera_base_topic(topic, false, &cam_base_topic)) {
+        cam_stream_to_topic[cam_base_topic] = topic;
+      } else if (ros2bag::isType(type, "sensor_msgs/msg/CompressedImage",
+                                 "sensor_msgs/CompressedImage") &&
+                 Ros2bagVioDataset::camera_base_topic(topic, true,
+                                                      &cam_base_topic) &&
+                 cam_stream_to_topic.find(cam_base_topic) ==
+                     cam_stream_to_topic.end()) {
+        cam_stream_to_topic[cam_base_topic] = topic;
       } else if (ros2bag::isType(type, "sensor_msgs/msg/Imu",
                                  "sensor_msgs/Imu") &&
                  topic.rfind("/fcu", 0) != 0) {
@@ -200,6 +354,10 @@ class Ros2bagIO : public DatasetIoInterface {
                                  "geometry_msgs/PointStamped")) {
         point_topic = topic;
       }
+    }
+
+    for (const auto &cam_stream : cam_stream_to_topic) {
+      cam_topics.insert(cam_stream.second);
     }
 
     std::cout << "imu_topic: " << imu_topic << std::endl;
@@ -237,7 +395,18 @@ class Ros2bagIO : public DatasetIoInterface {
       const std::string &topic = bag_msg->topic_name;
 
       if (cam_topics.find(topic) != cam_topics.end()) {
-        auto img_msg = ros2bag::deserialize<ros2bag::Image>(*bag_msg);
+        ros2bag::Image::SharedPtr img_msg;
+        if (ros2bag::isType(topic_types.at(topic), "sensor_msgs/msg/Image",
+                            "sensor_msgs/Image")) {
+          img_msg = ros2bag::deserialize<ros2bag::Image>(*bag_msg);
+        } else if (ros2bag::isType(topic_types.at(topic),
+                                   "sensor_msgs/msg/CompressedImage",
+                                   "sensor_msgs/CompressedImage")) {
+          auto compressed_msg =
+              ros2bag::deserialize<ros2bag::CompressedImage>(*bag_msg);
+          img_msg = Ros2bagVioDataset::decode_compressed_image(*compressed_msg);
+        }
+
         int64_t timestamp_ns =
             ros2bag::stampToNanoseconds(img_msg->header.stamp);
 

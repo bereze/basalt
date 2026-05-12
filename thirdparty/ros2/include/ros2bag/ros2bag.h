@@ -47,6 +47,15 @@ struct Image {
   std::vector<uint8_t> data;
 };
 
+struct CompressedImage {
+  using SharedPtr = std::shared_ptr<CompressedImage>;
+  using ConstSharedPtr = std::shared_ptr<const CompressedImage>;
+
+  Header header;
+  std::string format;
+  std::vector<uint8_t> data;
+};
+
 struct Imu {
   using SharedPtr = std::shared_ptr<Imu>;
 
@@ -131,6 +140,10 @@ std::shared_ptr<MsgT> deserialize(const SerializedMessage& bag_msg);
 
 template <>
 std::shared_ptr<Image> deserialize<Image>(const SerializedMessage& bag_msg);
+
+template <>
+std::shared_ptr<CompressedImage> deserialize<CompressedImage>(
+    const SerializedMessage& bag_msg);
 
 template <>
 std::shared_ptr<Imu> deserialize<Imu>(const SerializedMessage& bag_msg);

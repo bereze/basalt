@@ -837,7 +837,9 @@ void CamImuCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
           pangolin::glDrawCirclePerimeter(c[0], c[1], radius);
 
           if (show_ids)
-            pangolin::default_font().Text("%d", cr.corner_ids[i]).Draw(c[0], c[1]);
+            pangolin::default_font()
+                .Text("%d", cr.corner_ids[i])
+                .Draw(c[0], c[1]);
         }
 
         pangolin::default_font()
@@ -890,7 +892,9 @@ void CamImuCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
             .Draw(5, 100);
 
       } else {
-        pangolin::default_font().Text("Initial pose not processed").Draw(5, 100);
+        pangolin::default_font()
+            .Text("Initial pose not processed")
+            .Draw(5, 100);
       }
     }
 
@@ -911,10 +915,13 @@ void CamImuCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
             Eigen::Vector2d c = rc.corners_proj[i];
             pangolin::glDrawCirclePerimeter(c[0], c[1], 3.0);
 
-            if (show_ids) pangolin::default_font().Text("%d", i).Draw(c[0], c[1]);
+            if (show_ids)
+              pangolin::default_font().Text("%d", i).Draw(c[0], c[1]);
           }
         } else {
-          pangolin::default_font().Text("Too few corners detected.").Draw(5, 150);
+          pangolin::default_font()
+              .Text("Too few corners detected.")
+              .Draw(5, 150);
         }
       }
     }

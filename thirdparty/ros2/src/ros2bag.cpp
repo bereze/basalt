@@ -270,6 +270,17 @@ std::shared_ptr<Image> deserialize<Image>(const SerializedMessage& bag_msg) {
 }
 
 template <>
+std::shared_ptr<CompressedImage> deserialize<CompressedImage>(
+    const SerializedMessage& bag_msg) {
+  CdrReader reader(bag_msg.data);
+  auto msg = std::make_shared<CompressedImage>();
+  msg->header = readHeader(reader);
+  msg->format = reader.readString();
+  msg->data = reader.readUInt8Sequence();
+  return msg;
+}
+
+template <>
 std::shared_ptr<Imu> deserialize<Imu>(const SerializedMessage& bag_msg) {
   CdrReader reader(bag_msg.data);
   auto msg = std::make_shared<Imu>();
