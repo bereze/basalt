@@ -42,13 +42,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <tbb/concurrent_unordered_map.h>
 
+#include <pangolin/display/default_font.h>
 #include <pangolin/display/image_view.h>
 #include <pangolin/gl/gldraw.h>
 #include <pangolin/image/image.h>
 #include <pangolin/image/image_io.h>
 #include <pangolin/image/typed_image.h>
 #include <pangolin/pangolin.h>
-#include <pangolin/display/default_font.h>
 
 #include <CLI/CLI.hpp>
 
@@ -302,6 +302,15 @@ void draw_image_overlay(pangolin::View& v, size_t cam_id) {
             kv.second.linear() * opt_flow_ptr->patch_coord;
         transformed_patch.colwise() += kv.second.translation();
 
+        // 如果这个点被跟踪了很多帧，就画红色的圆；如果是新点，就画蓝色的圆；其他情况画绿色的圆
+        if (keypoint_stats[kv.first] > 7) {
+          glColor4f(1.0, 0.0, 0.0, 0.5);
+        } else if (keypoint_stats[kv.first] == 1) {
+          glColor4f(0.0, 0.0, 1.0, 0.5);
+        } else {
+          glColor4f(0.0, 1.0, 0.0, 0.5);
+        }
+
         for (int i = 0; i < transformed_patch.cols(); i++) {
           const Eigen::Vector2f c = transformed_patch.col(i);
           pangolin::glDrawCirclePerimeter(c[0], c[1], 0.5f);
@@ -310,7 +319,9 @@ void draw_image_overlay(pangolin::View& v, size_t cam_id) {
         const Eigen::Vector2f c = kv.second.translation();
 
         if (show_ids)
-          pangolin::default_font().Text("%d", kv.first).Draw(5 + c[0], 5 + c[1]);
+          pangolin::default_font()
+              .Text("%d", kv.first)
+              .Draw(5 + c[0], 5 + c[1]);
       }
 
       pangolin::default_font()

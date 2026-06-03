@@ -42,13 +42,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <tbb/concurrent_unordered_map.h>
 
+#include <pangolin/display/default_font.h>
 #include <pangolin/display/image_view.h>
 #include <pangolin/gl/gldraw.h>
 #include <pangolin/image/image.h>
 #include <pangolin/image/image_io.h>
 #include <pangolin/image/typed_image.h>
 #include <pangolin/pangolin.h>
-#include <pangolin/display/default_font.h>
 
 #include <CLI/CLI.hpp>
 
@@ -62,8 +62,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/calibration/calibration.hpp>
 
 #include <basalt/serialization/headers_serialization.h>
-
-#include <basalt/utils/vis_utils.h>
 
 // GUI functions
 void draw_image_overlay(pangolin::View& v, size_t cam_id);
@@ -174,8 +172,7 @@ int main(int argc, char** argv) {
       ->required();
 
   app.add_option("--marg-data", marg_data_path,
-                 "Folder to store marginalization data.")
-      ->required();
+                 "Folder to store marginalization data.");
 
   app.add_option("--result-path", result_path,
                  "Path to result file where the system will write RMSE ATE.");
@@ -471,7 +468,9 @@ void draw_image_overlay(pangolin::View& v, size_t cam_id) {
           pangolin::default_font().Text("%d", cr.id[i]).Draw(c[0], c[1]);
       }
 
-      pangolin::default_font().Text("%d noisy points", cr.pos.size()).Draw(5, 40);
+      pangolin::default_font()
+          .Text("%d noisy points", cr.pos.size())
+          .Draw(5, 40);
     }
   }
 

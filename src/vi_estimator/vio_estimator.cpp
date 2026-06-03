@@ -35,6 +35,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <basalt/vi_estimator/vio_estimator.h>
 
+#include <basalt/vi_estimator/schur_vins_ekf.h>
 #include <basalt/vi_estimator/sqrt_keypoint_vio.h>
 #include <basalt/vi_estimator/sqrt_keypoint_vo.h>
 
@@ -49,9 +50,16 @@ VioEstimatorBase::Ptr factory_helper(const VioConfig& config,
   VioEstimatorBase::Ptr res;
 
   if (use_imu) {
-    res.reset(new SqrtKeypointVioEstimator<Scalar>(g, cam, config));
+    if (config.vio_backend_type == VioBackendType::SCHUR_EKF) {
+      res.reset(new SchurVinsEkfEstimator(g, cam, config));
+    } else {
+      res.reset(new SqrtKeypointVioEstimator<Scalar>(g, cam, config));
+    }
 
   } else {
+    if (config.vio_backend_type == VioBackendType::SCHUR_EKF) {
+      BASALT_LOG_FATAL("SCHUR_EKF backend requires IMU input.");
+    }
     res.reset(new SqrtKeypointVoEstimator<Scalar>(cam, config));
   }
 

@@ -11,6 +11,9 @@ target_link_libraries(test_spline_opt gtest gtest_main basalt)
 add_executable(test_vio src/test_vio.cpp)
 target_link_libraries(test_vio gtest gtest_main basalt)
 
+add_executable(test_schur_vins_ekf src/test_schur_vins_ekf.cpp)
+target_link_libraries(test_schur_vins_ekf gtest gtest_main basalt)
+
 add_executable(test_nfr src/test_nfr.cpp)
 target_link_libraries(test_nfr gtest gtest_main basalt)
 
@@ -33,6 +36,7 @@ include(GoogleTest)
 
 gtest_add_tests(TARGET test_spline_opt AUTO)
 gtest_add_tests(TARGET test_vio AUTO)
+gtest_add_tests(TARGET test_schur_vins_ekf AUTO)
 gtest_add_tests(TARGET test_nfr AUTO)
 gtest_add_tests(TARGET test_qr AUTO)
 gtest_add_tests(TARGET test_linearization AUTO)

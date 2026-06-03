@@ -38,6 +38,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <fstream>
 
+#include <nlohmann/json.hpp>
+
 #include <cereal/archives/json.hpp>
 #include <cereal/cereal.hpp>
 #include <magic_enum/magic_enum.hpp>
@@ -56,6 +58,7 @@ VioConfig::VioConfig() {
   optical_flow_skip_frames = 1;
 
   vio_linearization_type = LinearizationType::ABS_QR;
+  vio_backend_type = VioBackendType::SQRT_BA;
   vio_sqrt_marg = true;
 
   vio_max_states = 3;
@@ -88,6 +91,16 @@ VioConfig::VioConfig() {
   vio_marg_lost_landmarks = true;
 
   vio_kf_marg_feature_ratio = 0.1;
+
+  vio_schur_max_frames = 4;
+  vio_schur_huber_thresh = 1.5;
+  vio_schur_min_obs = 3;
+  vio_schur_outlier_threshold = 4.0;
+  vio_schur_point_outlier_threshold = 3.0;
+  vio_schur_point_cov_init = 100.0;
+  vio_schur_focal_length = -1.0;
+  vio_schur_max_iterations = 1;
+  vio_schur_use_pixel_residual = false;
 
   mapper_obs_std_dev = 0.25;
   mapper_obs_huber_thresh = 1.5;
@@ -127,6 +140,42 @@ void VioConfig::load(const std::string& filename) {
     archive(*this);
   }
   is.close();
+
+  std::ifstream optional_is(filename);
+  if (!optional_is) return;
+
+  nlohmann::json root;
+  optional_is >> root;
+  if (!root.contains("value0")) return;
+
+  const auto& value = root.at("value0");
+
+  auto read_enum = [&](const char* key, auto& target) {
+    if (!value.contains(key)) return;
+    const auto enum_value = magic_enum::enum_cast<std::decay_t<decltype(target)>>(value.at(key).get<std::string>());
+    if (enum_value.has_value()) {
+      target = enum_value.value();
+    } else {
+      std::cerr << "Could not find enum value for " << key << ": "
+                << value.at(key).get<std::string>() << std::endl;
+      std::abort();
+    }
+  };
+
+  auto read_value = [&](const char* key, auto& target) {
+    if (value.contains(key)) target = value.at(key).get<std::decay_t<decltype(target)>>();
+  };
+
+  read_enum("config.vio_backend_type", vio_backend_type);
+  read_value("config.vio_schur_max_frames", vio_schur_max_frames);
+  read_value("config.vio_schur_huber_thresh", vio_schur_huber_thresh);
+  read_value("config.vio_schur_min_obs", vio_schur_min_obs);
+  read_value("config.vio_schur_outlier_threshold", vio_schur_outlier_threshold);
+  read_value("config.vio_schur_point_outlier_threshold", vio_schur_point_outlier_threshold);
+  read_value("config.vio_schur_point_cov_init", vio_schur_point_cov_init);
+  read_value("config.vio_schur_focal_length", vio_schur_focal_length);
+  read_value("config.vio_schur_max_iterations", vio_schur_max_iterations);
+  read_value("config.vio_schur_use_pixel_residual", vio_schur_use_pixel_residual);
 }
 }  // namespace basalt
 
@@ -157,6 +206,30 @@ void load_minimal(const Archive& ar,
   }
 }
 
+
+template <class Archive>
+std::string save_minimal(const Archive& ar,
+                         const basalt::VioBackendType& vio_backend_type) {
+  UNUSED(ar);
+  auto name = magic_enum::enum_name(vio_backend_type);
+  return std::string(name);
+}
+
+template <class Archive>
+void load_minimal(const Archive& ar, basalt::VioBackendType& vio_backend_type,
+                  const std::string& name) {
+  UNUSED(ar);
+
+  auto backend_enum = magic_enum::enum_cast<basalt::VioBackendType>(name);
+
+  if (backend_enum.has_value()) {
+    vio_backend_type = backend_enum.value();
+  } else {
+    std::cerr << "Could not find the VioBackendType for " << name << std::endl;
+    std::abort();
+  }
+}
+
 template <class Archive>
 void serialize(Archive& ar, basalt::VioConfig& config) {
   ar(CEREAL_NVP(config.optical_flow_type));
@@ -169,6 +242,9 @@ void serialize(Archive& ar, basalt::VioConfig& config) {
   ar(CEREAL_NVP(config.optical_flow_skip_frames));
 
   ar(CEREAL_NVP(config.vio_linearization_type));
+  if constexpr (Archive::is_saving::value) {
+    ar(CEREAL_NVP(config.vio_backend_type));
+  }
   ar(CEREAL_NVP(config.vio_sqrt_marg));
   ar(CEREAL_NVP(config.vio_max_states));
   ar(CEREAL_NVP(config.vio_max_kfs));
@@ -199,6 +275,18 @@ void serialize(Archive& ar, basalt::VioConfig& config) {
 
   ar(CEREAL_NVP(config.vio_marg_lost_landmarks));
   ar(CEREAL_NVP(config.vio_kf_marg_feature_ratio));
+
+  if constexpr (Archive::is_saving::value) {
+    ar(CEREAL_NVP(config.vio_schur_max_frames));
+    ar(CEREAL_NVP(config.vio_schur_huber_thresh));
+    ar(CEREAL_NVP(config.vio_schur_min_obs));
+    ar(CEREAL_NVP(config.vio_schur_outlier_threshold));
+    ar(CEREAL_NVP(config.vio_schur_point_outlier_threshold));
+    ar(CEREAL_NVP(config.vio_schur_point_cov_init));
+    ar(CEREAL_NVP(config.vio_schur_focal_length));
+    ar(CEREAL_NVP(config.vio_schur_max_iterations));
+    ar(CEREAL_NVP(config.vio_schur_use_pixel_residual));
+  }
 
   ar(CEREAL_NVP(config.mapper_obs_std_dev));
   ar(CEREAL_NVP(config.mapper_obs_huber_thresh));

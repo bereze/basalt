@@ -39,6 +39,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 namespace basalt {
 
 enum class LinearizationType { ABS_QR, ABS_SC, REL_SC };
+enum class VioBackendType { SQRT_BA, SCHUR_EKF };
 
 struct VioConfig {
   VioConfig();
@@ -55,6 +56,7 @@ struct VioConfig {
   int optical_flow_skip_frames;
 
   LinearizationType vio_linearization_type;
+  VioBackendType vio_backend_type;
   bool vio_sqrt_marg;
 
   int vio_max_states;
@@ -87,6 +89,16 @@ struct VioConfig {
 
   bool vio_marg_lost_landmarks;
   double vio_kf_marg_feature_ratio;
+
+  int vio_schur_max_frames;
+  double vio_schur_huber_thresh;
+  int vio_schur_min_obs;
+  double vio_schur_outlier_threshold;
+  double vio_schur_point_outlier_threshold;
+  double vio_schur_point_cov_init;
+  double vio_schur_focal_length;
+  int vio_schur_max_iterations;
+  bool vio_schur_use_pixel_residual;
 
   double mapper_obs_std_dev;
   double mapper_obs_huber_thresh;
