@@ -106,7 +106,9 @@ class MultiscaleFrameToFrameOpticalFlow : public OpticalFlowBase {
         break;
       }
 
+      Timer timer;
       processFrame(input_ptr->t_ns, input_ptr);
+      recordFrameTime(timer.elapsed());
     }
   }
 

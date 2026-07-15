@@ -37,48 +37,44 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <thread>
 
-#include <sophus/se2.hpp>
+#include <opencv2/video/tracking.hpp>
 
 #include <tbb/blocked_range.h>
-#include <tbb/concurrent_unordered_map.h>
 #include <tbb/parallel_for.h>
 
 #include <basalt/optical_flow/optical_flow.h>
-#include <basalt/optical_flow/patch.h>
+#include <basalt/optical_flow/patterns.h>
 
-#include <basalt/image/image_pyr.h>
 #include <basalt/utils/keypoints.h>
 
 namespace basalt {
 
-/// Unlike PatchOpticalFlow, FrameToFrameOpticalFlow always tracks patches
-/// against the previous frame, not the initial frame where a track was created.
-/// While it might cause more drift of the patch location, it leads to longer
-/// tracks in practice.
+/// Frame-to-frame optical flow that tracks keypoints with OpenCV's pyramidal
+/// Lucas-Kanade tracker (cv::calcOpticalFlowPyrLK) instead of basalt's own
+/// inverse-compositional patch tracker used by FrameToFrameOpticalFlow.
+/// Feature detection, forward-backward outlier rejection and stereo epipolar
+/// filtering follow the exact same scheme as FrameToFrameOpticalFlow, so the
+/// only thing that differs between the two classes is the KLT tracking
+/// implementation itself -- this makes them directly comparable.
 template <typename Scalar, template <typename> typename Pattern>
-class FrameToFrameOpticalFlow : public OpticalFlowBase {
+class OpenCVOpticalFlow : public OpticalFlowBase {
  public:
-  typedef OpticalFlowPatch<Scalar, Pattern<Scalar>> PatchT;
-
-  typedef Eigen::Matrix<Scalar, 2, 1> Vector2;
-  typedef Eigen::Matrix<Scalar, 2, 2> Matrix2;
-
-  typedef Eigen::Matrix<Scalar, 3, 1> Vector3;
-  typedef Eigen::Matrix<Scalar, 3, 3> Matrix3;
-
-  typedef Eigen::Matrix<Scalar, 4, 1> Vector4;
   typedef Eigen::Matrix<Scalar, 4, 4> Matrix4;
 
-  typedef Sophus::SE2<Scalar> SE2;
-
-  FrameToFrameOpticalFlow(const VioConfig& config,
-                          const basalt::Calibration<double>& calib)
-      : t_ns(-1), frame_counter(0), last_keypoint_id(0), config(config) {
+  OpenCVOpticalFlow(const VioConfig& config,
+                    const basalt::Calibration<double>& calib)
+      : t_ns(-1),
+        frame_counter(0),
+        last_keypoint_id(0),
+        config(config),
+        win_size(21, 21),
+        term_criteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS,
+                      config.optical_flow_max_iterations, 0.01) {
     input_queue.set_capacity(10);
 
     this->calib = calib.cast<Scalar>();
 
-    patch_coord = PatchT::pattern2.template cast<float>();
+    patch_coord = Pattern<Scalar>::pattern2.template cast<float>();
 
     if (calib.intrinsics.size() > 1) {
       Eigen::Matrix4d Ed;
@@ -88,10 +84,10 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     }
 
     processing_thread.reset(
-        new std::thread(&FrameToFrameOpticalFlow::processingLoop, this));
+        new std::thread(&OpenCVOpticalFlow::processingLoop, this));
   }
 
-  ~FrameToFrameOpticalFlow() { processing_thread->join(); }
+  ~OpenCVOpticalFlow() { processing_thread->join(); }
 
   void processingLoop() {
     OpticalFlowInput::Ptr input_ptr;
@@ -110,10 +106,37 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     }
   }
 
+  // Basalt images are stored as 16-bit (8-bit value shifted left by 8), so we
+  // shift back down to get a regular 8-bit image for OpenCV.
+  static cv::Mat toCvMat8U(const basalt::Image<const uint16_t>& img_raw) {
+    cv::Mat img(img_raw.h, img_raw.w, CV_8U);
+
+    uint8_t* dst = img.ptr();
+    const uint16_t* src = img_raw.ptr;
+
+    for (size_t i = 0; i < img_raw.size(); i++) {
+      dst[i] = src[i] >> 8;
+    }
+
+    return img;
+  }
+
   void processFrame(int64_t curr_t_ns, OpticalFlowInput::Ptr& new_img_vec) {
     for (const auto& v : new_img_vec->img_data) {
       if (!v.img.get()) return;
     }
+
+    std::vector<cv::Mat> new_images(calib.intrinsics.size());
+
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, calib.intrinsics.size()),
+                      [&](const tbb::blocked_range<size_t>& r) {
+                        for (size_t i = r.begin(); i != r.end(); ++i) {
+                          const auto& img = *new_img_vec->img_data[i].img;
+                          const basalt::Image<const uint16_t> img_raw(
+                              img.ptr, img.w, img.h, img.pitch);
+                          new_images[i] = toCvMat8U(img_raw);
+                        }
+                      });
 
     if (t_ns < 0) {
       t_ns = curr_t_ns;
@@ -122,17 +145,7 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
       transforms->observations.resize(calib.intrinsics.size());
       transforms->t_ns = t_ns;
 
-      pyramid.reset(new std::vector<basalt::ManagedImagePyr<uint16_t>>);
-      pyramid->resize(calib.intrinsics.size());
-
-      tbb::parallel_for(tbb::blocked_range<size_t>(0, calib.intrinsics.size()),
-                        [&](const tbb::blocked_range<size_t>& r) {
-                          for (size_t i = r.begin(); i != r.end(); ++i) {
-                            pyramid->at(i).setFromImage(
-                                *new_img_vec->img_data[i].img,
-                                config.optical_flow_levels);
-                          }
-                        });
+      images = new_images;
 
       transforms->input_images = new_img_vec;
 
@@ -142,18 +155,8 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     } else {
       t_ns = curr_t_ns;
 
-      old_pyramid = pyramid;
-
-      pyramid.reset(new std::vector<basalt::ManagedImagePyr<uint16_t>>);
-      pyramid->resize(calib.intrinsics.size());
-      tbb::parallel_for(tbb::blocked_range<size_t>(0, calib.intrinsics.size()),
-                        [&](const tbb::blocked_range<size_t>& r) {
-                          for (size_t i = r.begin(); i != r.end(); ++i) {
-                            pyramid->at(i).setFromImage(
-                                *new_img_vec->img_data[i].img,
-                                config.optical_flow_levels);
-                          }
-                        });
+      old_images = images;
+      images = new_images;
 
       OpticalFlowResult::Ptr new_transforms;
       new_transforms.reset(new OpticalFlowResult);
@@ -161,7 +164,7 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
       new_transforms->t_ns = t_ns;
 
       for (size_t i = 0; i < calib.intrinsics.size(); i++) {
-        trackPoints(old_pyramid->at(i), pyramid->at(i),
+        trackPoints(old_images.at(i), images.at(i),
                     transforms->observations[i],
                     new_transforms->observations[i]);
       }
@@ -180,131 +183,73 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     frame_counter++;
   }
 
-  void trackPoints(const basalt::ManagedImagePyr<uint16_t>& pyr_1,
-                   const basalt::ManagedImagePyr<uint16_t>& pyr_2,
+  // Track points from img_1 to img_2 with OpenCV's pyramidal KLT tracker,
+  // then track back from img_2 to img_1 and discard points whose recovered
+  // position is too far from the original one (forward-backward check).
+  void trackPoints(const cv::Mat& img_1, const cv::Mat& img_2,
                    const Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
                        transform_map_1,
                    Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f>&
                        transform_map_2) const {
-    size_t num_points = transform_map_1.size();
+    transform_map_2.clear();
+
+    const size_t num_points = transform_map_1.size();
+    if (num_points == 0) return;
 
     std::vector<KeypointId> ids;
-    Eigen::aligned_vector<Eigen::AffineCompact2f> init_vec;
+    Eigen::aligned_vector<Eigen::AffineCompact2f> init_transforms;
+    std::vector<cv::Point2f> pts_1;
 
     ids.reserve(num_points);
-    init_vec.reserve(num_points);
+    init_transforms.reserve(num_points);
+    pts_1.reserve(num_points);
 
     for (const auto& kv : transform_map_1) {
       ids.push_back(kv.first);
-      init_vec.push_back(kv.second);
+      init_transforms.push_back(kv.second);
+      pts_1.emplace_back(kv.second.translation().x(),
+                         kv.second.translation().y());
     }
 
-    tbb::concurrent_unordered_map<KeypointId, Eigen::AffineCompact2f,
-                                  std::hash<KeypointId>>
-        result;
+    std::vector<cv::Point2f> pts_2;
+    std::vector<uchar> status_fwd;
+    std::vector<float> err_fwd;
 
-    auto compute_func = [&](const tbb::blocked_range<size_t>& range) {
-      for (size_t r = range.begin(); r != range.end(); ++r) {
-        const KeypointId id = ids[r];
+    cv::calcOpticalFlowPyrLK(img_1, img_2, pts_1, pts_2, status_fwd, err_fwd,
+                             win_size, config.optical_flow_levels,
+                             term_criteria);
 
-        const Eigen::AffineCompact2f& transform_1 = init_vec[r];
-        Eigen::AffineCompact2f transform_2 = transform_1;
+    std::vector<cv::Point2f> pts_1_recovered;
+    std::vector<uchar> status_bwd;
+    std::vector<float> err_bwd;
 
-        bool valid = trackPoint(pyr_1, pyr_2, transform_1, transform_2);
+    cv::calcOpticalFlowPyrLK(img_2, img_1, pts_2, pts_1_recovered, status_bwd,
+                             err_bwd, win_size, config.optical_flow_levels,
+                             term_criteria);
 
-        if (valid) {
-          Eigen::AffineCompact2f transform_1_recovered = transform_2;
+    const float filter_margin = 2;
 
-          valid = trackPoint(pyr_2, pyr_1, transform_2, transform_1_recovered);
+    for (size_t i = 0; i < ids.size(); i++) {
+      if (!status_fwd[i] || !status_bwd[i]) continue;
 
-          if (valid) {
-            Scalar dist2 = (transform_1.translation() -
-                            transform_1_recovered.translation())
-                               .squaredNorm();
+      if (pts_2[i].x < filter_margin ||
+          pts_2[i].x >= img_2.cols - filter_margin ||
+          pts_2[i].y < filter_margin ||
+          pts_2[i].y >= img_2.rows - filter_margin)
+        continue;
 
-            if (dist2 < config.optical_flow_max_recovered_dist2) {
-              result[id] = transform_2;
-            }
-          }
-        }
-      }
-    };
+      const float dist2 = (Eigen::Vector2f(pts_1[i].x, pts_1[i].y) -
+                           Eigen::Vector2f(pts_1_recovered[i].x,
+                                           pts_1_recovered[i].y))
+                              .squaredNorm();
 
-    tbb::blocked_range<size_t> range(0, num_points);
+      if (dist2 >= config.optical_flow_max_recovered_dist2) continue;
 
-    tbb::parallel_for(range, compute_func);
-    // compute_func(range);
+      Eigen::AffineCompact2f transform = init_transforms[i];
+      transform.translation() = Eigen::Vector2f(pts_2[i].x, pts_2[i].y);
 
-    transform_map_2.clear();
-    transform_map_2.insert(result.begin(), result.end());
-  }
-
-  inline bool trackPoint(const basalt::ManagedImagePyr<uint16_t>& old_pyr,
-                         const basalt::ManagedImagePyr<uint16_t>& pyr,
-                         const Eigen::AffineCompact2f& old_transform,
-                         Eigen::AffineCompact2f& transform) const {
-    bool patch_valid = true;
-
-    transform.linear().setIdentity();
-
-    for (int level = config.optical_flow_levels; level >= 0 && patch_valid;
-         level--) {
-      const Scalar scale = 1 << level;
-
-      transform.translation() /= scale;
-
-      PatchT p(old_pyr.lvl(level), old_transform.translation() / scale);
-
-      patch_valid &= p.valid;
-      if (patch_valid) {
-        // Perform tracking on current level
-        patch_valid &= trackPointAtLevel(pyr.lvl(level), p, transform);
-      }
-
-      transform.translation() *= scale;
+      transform_map_2[ids[i]] = transform;
     }
-
-    transform.linear() = old_transform.linear() * transform.linear();
-
-    return patch_valid;
-  }
-
-  inline bool trackPointAtLevel(const Image<const uint16_t>& img_2,
-                                const PatchT& dp,
-                                Eigen::AffineCompact2f& transform) const {
-    bool patch_valid = true;
-
-    for (int iteration = 0;
-         patch_valid && iteration < config.optical_flow_max_iterations;
-         iteration++) {
-      typename PatchT::VectorP res;
-
-      typename PatchT::Matrix2P transformed_pat =
-          transform.linear().matrix() * PatchT::pattern2;
-      transformed_pat.colwise() += transform.translation();
-
-      patch_valid &= dp.residual(img_2, transformed_pat, res);
-
-      if (patch_valid) {
-        const Vector3 inc = -dp.H_se2_inv_J_se2_T * res;
-
-        // avoid NaN in increment (leads to SE2::exp crashing)
-        patch_valid &= inc.array().isFinite().all();
-
-        // avoid very large increment
-        patch_valid &= inc.template lpNorm<Eigen::Infinity>() < 1e6;
-
-        if (patch_valid) {
-          transform *= SE2::exp(inc).matrix();
-
-          const int filter_margin = 2;
-
-          patch_valid &= img_2.InBounds(transform.translation(), filter_margin);
-        }
-      }
-    }
-
-    return patch_valid;
   }
 
   void addPoints() {
@@ -316,8 +261,12 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
 
     KeypointsData kd;
 
-    detectKeypoints(pyramid->at(0).lvl(0), kd,
-                    config.optical_flow_detection_grid_size, 1, pts0);
+    const auto& img0 = *transforms->input_images->img_data[0].img;
+    const basalt::Image<const uint16_t> img_raw(img0.ptr, img0.w, img0.h,
+                                                img0.pitch);
+
+    detectKeypoints(img_raw, kd, config.optical_flow_detection_grid_size, 1,
+                    pts0);
 
     Eigen::aligned_map<KeypointId, Eigen::AffineCompact2f> new_poses0,
         new_poses1;
@@ -334,7 +283,7 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
     }
 
     if (calib.intrinsics.size() > 1) {
-      trackPoints(pyramid->at(0), pyramid->at(1), new_poses0, new_poses1);
+      trackPoints(images.at(0), images.at(1), new_poses0, new_poses1);
 
       for (const auto& kv : new_poses1) {
         transforms->observations.at(1).emplace(kv);
@@ -395,9 +344,11 @@ class FrameToFrameOpticalFlow : public OpticalFlowBase {
   VioConfig config;
   basalt::Calibration<Scalar> calib;
 
+  cv::Size win_size;
+  cv::TermCriteria term_criteria;
+
   OpticalFlowResult::Ptr transforms;
-  std::shared_ptr<std::vector<basalt::ManagedImagePyr<uint16_t>>> old_pyramid,
-      pyramid;
+  std::vector<cv::Mat> old_images, images;
 
   Matrix4 E;
 

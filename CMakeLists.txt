@@ -274,7 +274,7 @@ if (TBB_INTERFACE_VERSION LESS 11004)
 endif()
 
 # NOTE: not specifying version, since 2, 3 or 4 is fine
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d highgui)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d highgui video)
 message(STATUS "Found OpenCV ${OpenCV_VERSION} headers in: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "Found OpenCV_LIBS: ${OpenCV_LIBS}")
 
@@ -330,6 +330,7 @@ target_sources(basalt
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/linearization/linearization_rel_sc.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/frame_to_frame_optical_flow.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/multiscale_frame_to_frame_optical_flow.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/opencv_optical_flow.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/optical_flow.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/patch.h
     ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/optical_flow/patch_optical_flow.h

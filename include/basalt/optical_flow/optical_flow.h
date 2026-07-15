@@ -34,6 +34,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #pragma once
 
+#include <iostream>
 #include <memory>
 
 #include <Eigen/Geometry>
@@ -44,6 +45,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/calibration/calibration.hpp>
 #include <basalt/camera/stereographic_param.hpp>
 #include <basalt/utils/sophus_utils.hpp>
+#include <basalt/utils/time_utils.hpp>
 
 #include <tbb/concurrent_queue.h>
 
@@ -78,6 +80,28 @@ class OpticalFlowBase {
   tbb::concurrent_bounded_queue<OpticalFlowResult::Ptr>* output_queue = nullptr;
 
   Eigen::MatrixXf patch_coord;
+
+ protected:
+  // Number of processed frames between average-timing printouts.
+  static constexpr size_t TIMING_PRINT_EVERY_N_FRAMES = 100;
+
+  // Accumulate the time it took to process one frame and periodically print
+  // the running average optical flow processing time.
+  void recordFrameTime(double time_s) {
+    total_frame_time_s_ += time_s;
+    num_timed_frames_++;
+
+    if (num_timed_frames_ % TIMING_PRINT_EVERY_N_FRAMES == 0) {
+      std::cout << "[optical_flow] average processing time over "
+                << num_timed_frames_ << " frames: "
+                << 1000.0 * total_frame_time_s_ / num_timed_frames_
+                << " ms/frame" << std::endl;
+    }
+  }
+
+ private:
+  double total_frame_time_s_ = 0;
+  size_t num_timed_frames_ = 0;
 };
 
 class OpticalFlowFactory {
