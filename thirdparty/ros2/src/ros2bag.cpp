@@ -2,10 +2,15 @@
 
 #include <sqlite3.h>
 
+#define MCAP_IMPLEMENTATION
+#include <mcap/reader.hpp>
+
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <cstring>
+#include <iostream>
+#include <optional>
 #include <stdexcept>
 
 namespace ros2bag {
@@ -23,26 +28,43 @@ bool endsWith(const std::string& value, const std::string& suffix) {
              0;
 }
 
-std::string findDb3File(const std::string& path) {
-  if (!isDirectory(path)) return path;
+enum class BagFormat { Sqlite3, Mcap };
+
+struct ResolvedBagFile {
+  BagFormat format;
+  std::string path;
+};
+
+ResolvedBagFile resolveBagFile(const std::string& path) {
+  if (!isDirectory(path)) {
+    if (endsWith(path, ".mcap")) return {BagFormat::Mcap, path};
+    if (endsWith(path, ".db3")) return {BagFormat::Sqlite3, path};
+    throw std::runtime_error("Unrecognized rosbag2 file extension: " + path);
+  }
 
   DIR* dir = opendir(path.c_str());
   if (!dir) throw std::runtime_error("Failed to open bag directory: " + path);
 
-  std::vector<std::string> candidates;
+  std::vector<std::string> db3_candidates;
+  std::vector<std::string> mcap_candidates;
   while (dirent* entry = readdir(dir)) {
     std::string name = entry->d_name;
     if (name == "." || name == "..") continue;
-    if (endsWith(name, ".db3")) candidates.push_back(path + "/" + name);
+    if (endsWith(name, ".db3")) db3_candidates.push_back(path + "/" + name);
+    if (endsWith(name, ".mcap")) mcap_candidates.push_back(path + "/" + name);
   }
   closedir(dir);
 
-  std::sort(candidates.begin(), candidates.end());
-  if (candidates.empty()) {
-    throw std::runtime_error("No rosbag2 sqlite3 .db3 file found in: " + path);
-  }
+  std::sort(db3_candidates.begin(), db3_candidates.end());
+  std::sort(mcap_candidates.begin(), mcap_candidates.end());
 
-  return candidates.front();
+  // A rosbag2 directory is normally produced by a single storage plugin, so
+  // finding candidates of both kinds should not happen in practice; prefer
+  // .mcap deterministically if it ever does.
+  if (!mcap_candidates.empty()) return {BagFormat::Mcap, mcap_candidates.front()};
+  if (!db3_candidates.empty()) return {BagFormat::Sqlite3, db3_candidates.front()};
+
+  throw std::runtime_error("No rosbag2 .db3 or .mcap file found in: " + path);
 }
 
 class SqliteStatement {
@@ -154,19 +176,189 @@ void readDoubleArray(CdrReader& reader, double* values, size_t size) {
   for (size_t i = 0; i < size; i++) values[i] = reader.readDouble();
 }
 
+// Common interface implemented by each storage backend (sqlite3 or mcap), so
+// that ros2bag::Reader can stay agnostic of the underlying container format.
+struct BackendReader {
+  virtual ~BackendReader() = default;
+  virtual const std::vector<TopicInfo>& topics() const = 0;
+  virtual bool has_next() = 0;
+  virtual std::shared_ptr<SerializedMessage> read_next() = 0;
+};
+
+class Sqlite3BackendReader : public BackendReader {
+ public:
+  explicit Sqlite3BackendReader(const std::string& db_path) {
+    if (sqlite3_open_v2(db_path.c_str(), &db_, SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK) {
+      throw std::runtime_error("Failed to open rosbag2 sqlite database: " +
+                               db_path);
+    }
+
+    SqliteStatement topic_stmt(
+        db_,
+        "SELECT id, name, type, serialization_format FROM topics ORDER BY id;");
+
+    while (sqlite3_step(topic_stmt.get()) == SQLITE_ROW) {
+      TopicInfo topic;
+      topic.id = sqlite3_column_int64(topic_stmt.get(), 0);
+      topic.name = reinterpret_cast<const char*>(
+          sqlite3_column_text(topic_stmt.get(), 1));
+      topic.type = reinterpret_cast<const char*>(
+          sqlite3_column_text(topic_stmt.get(), 2));
+      topic.serialization_format = reinterpret_cast<const char*>(
+          sqlite3_column_text(topic_stmt.get(), 3));
+
+      topics_.push_back(topic);
+      topics_by_id_[topic.id] = topic;
+    }
+
+    read_statement_.reset(new SqliteStatement(
+        db_, "SELECT topic_id, timestamp, data FROM messages "
+             "ORDER BY timestamp, id;"));
+  }
+
+  ~Sqlite3BackendReader() override {
+    read_statement_.reset();
+    if (db_) sqlite3_close(db_);
+  }
+
+  const std::vector<TopicInfo>& topics() const override { return topics_; }
+
+  bool has_next() override {
+    if (row_ready_) return true;
+
+    int rc = sqlite3_step(read_statement_->get());
+    if (rc == SQLITE_ROW) {
+      row_ready_ = true;
+      return true;
+    }
+    if (rc == SQLITE_DONE) return false;
+
+    throw std::runtime_error(sqlite3_errmsg(db_));
+  }
+
+  std::shared_ptr<SerializedMessage> read_next() override {
+    if (!has_next()) return nullptr;
+
+    sqlite3_stmt* stmt = read_statement_->get();
+    int64_t topic_id = sqlite3_column_int64(stmt, 0);
+    auto topic_it = topics_by_id_.find(topic_id);
+    if (topic_it == topics_by_id_.end()) {
+      throw std::runtime_error("Message references unknown topic id");
+    }
+
+    auto msg = std::make_shared<SerializedMessage>();
+    msg->topic_name = topic_it->second.name;
+    msg->time_stamp = sqlite3_column_int64(stmt, 1);
+
+    const void* blob = sqlite3_column_blob(stmt, 2);
+    int size = sqlite3_column_bytes(stmt, 2);
+    const auto* begin = static_cast<const uint8_t*>(blob);
+    msg->data.assign(begin, begin + size);
+
+    row_ready_ = false;
+    return msg;
+  }
+
+ private:
+  sqlite3* db_ = nullptr;
+  std::vector<TopicInfo> topics_;
+  std::unordered_map<int64_t, TopicInfo> topics_by_id_;
+  std::unique_ptr<SqliteStatement> read_statement_;
+  bool row_ready_ = false;
+};
+
+class McapBackendReader : public BackendReader {
+ public:
+  explicit McapBackendReader(const std::string& path) {
+    const mcap::Status open_status = reader_.open(path);
+    if (!open_status.ok()) {
+      throw std::runtime_error("Failed to open mcap file '" + path +
+                               "': " + open_status.message);
+    }
+
+    const mcap::Status summary_status =
+        reader_.readSummary(mcap::ReadSummaryMethod::AllowFallbackScan);
+    if (!summary_status.ok()) {
+      std::cerr << "Warning: failed to read mcap summary for '" << path
+                << "': " << summary_status.message << std::endl;
+    }
+
+    for (const auto& channel_entry : reader_.channels()) {
+      const auto& channel = channel_entry.second;
+
+      TopicInfo topic;
+      topic.id = channel->id;
+      topic.name = channel->topic;
+      topic.serialization_format = channel->messageEncoding;
+      if (mcap::SchemaPtr schema = reader_.schema(channel->schemaId)) {
+        topic.type = schema->name;
+      }
+      topics_.push_back(topic);
+    }
+
+    mcap::ReadMessageOptions options;
+    options.readOrder = hasUsableMessageIndex()
+                             ? mcap::ReadMessageOptions::ReadOrder::LogTimeOrder
+                             : mcap::ReadMessageOptions::ReadOrder::FileOrder;
+    if (options.readOrder == mcap::ReadMessageOptions::ReadOrder::FileOrder) {
+      std::cerr << "Warning: mcap file '" << path
+                << "' has no usable message index; reading in file order, "
+                   "which may not be timestamp-sorted."
+                << std::endl;
+    }
+
+    view_.emplace(reader_.readMessages(
+        [](const mcap::Status& status) {
+          std::cerr << "mcap read warning: " << status.message << std::endl;
+        },
+        options));
+    it_.emplace(view_->begin());
+    end_.emplace(view_->end());
+  }
+
+  const std::vector<TopicInfo>& topics() const override { return topics_; }
+
+  bool has_next() override { return *it_ != *end_; }
+
+  std::shared_ptr<SerializedMessage> read_next() override {
+    if (!has_next()) return nullptr;
+
+    mcap::LinearMessageView::Iterator& it = *it_;
+    const mcap::MessageView& mv = *it;
+
+    auto msg = std::make_shared<SerializedMessage>();
+    msg->topic_name = mv.channel->topic;
+    msg->time_stamp = static_cast<int64_t>(mv.message.logTime);
+
+    // mcap::Message::data is only valid until the iterator is advanced, so
+    // the payload must be copied out before incrementing it below.
+    const auto* begin = reinterpret_cast<const uint8_t*>(mv.message.data);
+    msg->data.assign(begin, begin + mv.message.dataSize);
+
+    ++it;
+    return msg;
+  }
+
+ private:
+  bool hasUsableMessageIndex() const {
+    const auto& chunk_indexes = reader_.chunkIndexes();
+    return std::any_of(
+        chunk_indexes.begin(), chunk_indexes.end(),
+        [](const mcap::ChunkIndex& ci) { return ci.messageIndexLength > 0; });
+  }
+
+  mcap::McapReader reader_;
+  std::vector<TopicInfo> topics_;
+  std::optional<mcap::LinearMessageView> view_;
+  std::optional<mcap::LinearMessageView::Iterator> it_;
+  std::optional<mcap::LinearMessageView::Iterator> end_;
+};
+
 }  // namespace
 
 struct Reader::Impl {
-  sqlite3* db = nullptr;
-  std::vector<TopicInfo> topics;
-  std::unordered_map<int64_t, TopicInfo> topics_by_id;
-  std::unique_ptr<SqliteStatement> read_statement;
-  bool row_ready = false;
-
-  ~Impl() {
-    read_statement.reset();
-    if (db) sqlite3_close(db);
-  }
+  std::unique_ptr<BackendReader> backend;
 };
 
 Reader::Reader() : impl_(new Impl) {}
@@ -174,76 +366,25 @@ Reader::Reader() : impl_(new Impl) {}
 Reader::~Reader() = default;
 
 void Reader::open(const std::string& path) {
-  const std::string db_path = findDb3File(path);
-
-  if (sqlite3_open_v2(db_path.c_str(), &impl_->db, SQLITE_OPEN_READONLY,
-                      nullptr) != SQLITE_OK) {
-    throw std::runtime_error("Failed to open rosbag2 sqlite database: " +
-                             db_path);
+  const ResolvedBagFile resolved = resolveBagFile(path);
+  switch (resolved.format) {
+    case BagFormat::Sqlite3:
+      impl_->backend.reset(new Sqlite3BackendReader(resolved.path));
+      break;
+    case BagFormat::Mcap:
+      impl_->backend.reset(new McapBackendReader(resolved.path));
+      break;
   }
-
-  SqliteStatement topic_stmt(
-      impl_->db,
-      "SELECT id, name, type, serialization_format FROM topics ORDER BY id;");
-
-  while (sqlite3_step(topic_stmt.get()) == SQLITE_ROW) {
-    TopicInfo topic;
-    topic.id = sqlite3_column_int64(topic_stmt.get(), 0);
-    topic.name =
-        reinterpret_cast<const char*>(sqlite3_column_text(topic_stmt.get(), 1));
-    topic.type =
-        reinterpret_cast<const char*>(sqlite3_column_text(topic_stmt.get(), 2));
-    topic.serialization_format =
-        reinterpret_cast<const char*>(sqlite3_column_text(topic_stmt.get(), 3));
-
-    impl_->topics.push_back(topic);
-    impl_->topics_by_id[topic.id] = topic;
-  }
-
-  impl_->read_statement.reset(
-      new SqliteStatement(impl_->db,
-                          "SELECT topic_id, timestamp, data FROM messages "
-                          "ORDER BY timestamp, id;"));
 }
 
 const std::vector<TopicInfo>& Reader::get_all_topics_and_types() const {
-  return impl_->topics;
+  return impl_->backend->topics();
 }
 
-bool Reader::has_next() {
-  if (impl_->row_ready) return true;
-
-  int rc = sqlite3_step(impl_->read_statement->get());
-  if (rc == SQLITE_ROW) {
-    impl_->row_ready = true;
-    return true;
-  }
-  if (rc == SQLITE_DONE) return false;
-
-  throw std::runtime_error(sqlite3_errmsg(impl_->db));
-}
+bool Reader::has_next() { return impl_->backend->has_next(); }
 
 std::shared_ptr<SerializedMessage> Reader::read_next() {
-  if (!has_next()) return nullptr;
-
-  sqlite3_stmt* stmt = impl_->read_statement->get();
-  int64_t topic_id = sqlite3_column_int64(stmt, 0);
-  auto topic_it = impl_->topics_by_id.find(topic_id);
-  if (topic_it == impl_->topics_by_id.end()) {
-    throw std::runtime_error("Message references unknown topic id");
-  }
-
-  auto msg = std::make_shared<SerializedMessage>();
-  msg->topic_name = topic_it->second.name;
-  msg->time_stamp = sqlite3_column_int64(stmt, 1);
-
-  const void* blob = sqlite3_column_blob(stmt, 2);
-  int size = sqlite3_column_bytes(stmt, 2);
-  const auto* begin = static_cast<const uint8_t*>(blob);
-  msg->data.assign(begin, begin + size);
-
-  impl_->row_ready = false;
-  return msg;
+  return impl_->backend->read_next();
 }
 
 int64_t stampToNanoseconds(const Time& stamp) {
